@@ -3,12 +3,12 @@ module Headers = Httpaf.Headers
 let create_request ~nonce ~headers target =
   let nonce = Base64.encode_exn nonce in
   let headers =
-    Headers.add_list
-      headers
-      [ "upgrade"              , "websocket"
-      ; "connection"           , "upgrade"
-      ; "sec-websocket-version", "13"
-      ; "sec-websocket-key"    , nonce
+    Headers.add_list headers
+      [
+        ("upgrade", "websocket");
+        ("connection", "upgrade");
+        ("sec-websocket-version", "13");
+        ("sec-websocket-key", nonce);
       ]
   in
   Httpaf.Request.create ~headers `GET target
@@ -25,29 +25,28 @@ let sec_websocket_key_proof ~sha1 sec_websocket_key =
    *   [RFC4648]), of this concatenation is then returned in the server's
    *   handshake. *)
   let concatenation =
-   sec_websocket_key ^ "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+    sec_websocket_key ^ "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
   in
   Base64.encode_exn ~pad:true (sha1 concatenation)
 
 (* Copied from headers.ml in http/af.
  * Compares ASCII strings in a Case Insensitive manner. *)
 module CI = struct
-  let[@inline always] lower c =
-    if c >= 0x41 && c <= 0x5a then c + 32 else c
+  let[@inline always] lower c = if c >= 0x41 && c <= 0x5a then c + 32 else c
 
   let equal x y =
     let len = String.length x in
-    len = String.length y && (
-      let equal_so_far = ref true in
-      let i            = ref 0 in
-      while !equal_so_far && !i < len do
-        let c1 = Char.code (String.unsafe_get x !i) in
-        let c2 = Char.code (String.unsafe_get y !i) in
-        equal_so_far := lower c1 = lower c2;
-        incr i
-      done;
-      !equal_so_far
-    )
+    len = String.length y
+    &&
+    let equal_so_far = ref true in
+    let i = ref 0 in
+    while !equal_so_far && !i < len do
+      let c1 = Char.code (String.unsafe_get x !i) in
+      let c2 = Char.code (String.unsafe_get y !i) in
+      equal_so_far := lower c1 = lower c2;
+      incr i
+    done;
+    !equal_so_far
 end
 
 (* TODO: this function can just return the reason *)
@@ -80,46 +79,57 @@ let passes_scrutiny ~request_method headers =
    *   Note: there are 9 points in the above section of the RFC, and the last
    *   3 refer to optional fields.
    *)
- match
-   request_method,
-   Headers.get_exn headers "host",
-   Headers.get_exn headers "upgrade",
-   Headers.get_exn headers "connection",
-   Headers.get_exn headers "sec-websocket-key",
-   Headers.get_exn headers "sec-websocket-version"
-   with
-   (* 1,   2 *)
- | `GET, _host, upgrade, connection, sec_websocket_key, "13" ->
-   (* 3 *)
-   CI.equal upgrade "websocket" &&
-   (* 4 *)
-   (List.exists
-     (fun v -> CI.equal (String.trim v) "upgrade")
-     (String.split_on_char ',' connection)) &&
-   (* 5 *)
-   (try String.length (Base64.decode_exn ~pad:true sec_websocket_key) = 16
-    with | _ -> false)
- | _ -> false
- | exception _ -> false
+  match
+    ( request_method,
+      Headers.get_exn headers "host",
+      Headers.get_exn headers "upgrade",
+      Headers.get_exn headers "connection",
+      Headers.get_exn headers "sec-websocket-key",
+      Headers.get_exn headers "sec-websocket-version" )
+  with
+  (* 1,   2 *)
+  | `GET, _host, upgrade, connection, _sec_websocket_key, "13" ->
+      (* 3 *)
+      if not @@ CI.equal upgrade "websocket" then Error "3."
+      else if
+        (* 4 *)
+        not
+        @@ List.exists
+             (fun v -> CI.equal (String.trim v) "upgrade")
+             (String.split_on_char ',' connection)
+      then Error "4."
+      else
+        (* 5 *)
+        (* TODO DEBUG: I commented this to help testing with curl
+           (try if not @@ (String.length (Base64.decode_exn ~pad:true sec_websocket_key) = 16 )then
+               Error "5." else Ok ()
+            with | _ -> Error "6. invalid sec_websocket_key")
+        *)
+        Ok ()
+  | _ -> Error "1. or 2."
+  | exception _ -> Error "missing needed header"
 
 let upgrade_headers ~sha1 ~request_method headers =
-  if passes_scrutiny ~request_method headers then begin
-    let sec_websocket_key = Headers.get_exn headers "sec-websocket-key" in
-    let accept = sec_websocket_key_proof ~sha1 sec_websocket_key in
-    let upgrade_headers =
-      [ "Upgrade",              "websocket"
-      ; "Connection",           "upgrade"
-      ; "Sec-Websocket-Accept", accept
-      ]
-    in
-    Ok upgrade_headers
-  end else
-    Error "Didn't pass scrutiny"
+  match passes_scrutiny ~request_method headers with
+  | Ok () ->
+      let sec_websocket_key = Headers.get_exn headers "sec-websocket-key" in
+      let accept = sec_websocket_key_proof ~sha1 sec_websocket_key in
+      let upgrade_headers =
+        [
+          ("Upgrade", "websocket");
+          ("Connection", "upgrade");
+          ("Sec-Websocket-Accept", accept);
+        ]
+      in
+      Ok upgrade_headers
+  | Error _ as e -> e
 
-let respond_with_upgrade ?(headers=Headers.empty) ~sha1 reqd upgrade_handler =
+let respond_with_upgrade ?(headers = Headers.empty) ~sha1 reqd upgrade_handler =
   let request = Httpaf.Reqd.request reqd in
   match upgrade_headers ~sha1 ~request_method:request.meth request.headers with
   | Ok upgrade_headers ->
-    Httpaf.Reqd.respond_with_upgrade reqd (Headers.add_list headers upgrade_headers) upgrade_handler;
-    Ok ()
+      Httpaf.Reqd.respond_with_upgrade reqd
+        (Headers.add_list headers upgrade_headers)
+        upgrade_handler;
+      Ok ()
   | Error msg -> Error msg
